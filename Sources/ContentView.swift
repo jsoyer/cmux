@@ -13271,7 +13271,6 @@ private struct TabItemView: View, Equatable {
                 workspaceIds: targetIds,
                 disabled: !allGitMetadataWatcherDisabled
             )
-            syncSelectionAfterMutation()
         }
 
         if !remoteContextMenuWorkspaceIds.isEmpty {

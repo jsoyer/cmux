@@ -169,9 +169,32 @@ struct SidebarWorkspaceAuxiliaryDetailVisibility: Equatable {
 private struct WorkspaceGitRepositoryInfo: Hashable, Sendable {
     let repoRoot: String
     let gitDirectory: String
+    let gitCommonDirectory: String
 
-    var gitConfigPath: String {
-        URL(fileURLWithPath: gitDirectory).appendingPathComponent("config").path
+    var gitConfigPaths: [String] {
+        var paths: [String] = []
+        var seen: Set<String> = []
+
+        let commonConfigPath = URL(fileURLWithPath: gitCommonDirectory).appendingPathComponent("config").path
+        if seen.insert(commonConfigPath).inserted {
+            paths.append(commonConfigPath)
+        }
+
+        let worktreeConfigPath = URL(fileURLWithPath: gitDirectory).appendingPathComponent("config.worktree").path
+        if seen.insert(worktreeConfigPath).inserted {
+            paths.append(worktreeConfigPath)
+        }
+
+        return paths
+    }
+
+    var gitWatcherRoots: [String] {
+        var roots: [String] = []
+        var seen: Set<String> = []
+        for path in [repoRoot, gitDirectory, gitCommonDirectory] where seen.insert(path).inserted {
+            roots.append(path)
+        }
+        return roots
     }
 
     var cmuxIgnorePath: String {
@@ -242,10 +265,7 @@ private final class WorkspaceGitEventWatcher {
             copyDescription: nil
         )
 
-        let pathsToWatch = [
-            repositoryInfo.repoRoot,
-            repositoryInfo.gitDirectory,
-        ] as CFArray
+        let pathsToWatch = repositoryInfo.gitWatcherRoots as CFArray
 
         let flags = FSEventStreamCreateFlags(
             kFSEventStreamCreateFlagFileEvents
@@ -317,28 +337,40 @@ private final class WorkspaceGitEventWatcher {
             return false
         }
 
-        if path == repositoryInfo.gitDirectory {
+        if isRelevantGitPath(path, root: repositoryInfo.gitDirectory) {
             return true
         }
 
-        if path.hasPrefix(repositoryInfo.gitDirectory + "/") {
-            let relativePath = String(path.dropFirst(repositoryInfo.gitDirectory.count + 1))
-            return relativePath == "HEAD"
-                || relativePath == "index"
-                || relativePath == "packed-refs"
-                || relativePath == "config"
-                || relativePath.hasPrefix("refs/")
+        if repositoryInfo.gitCommonDirectory != repositoryInfo.gitDirectory,
+           isRelevantGitPath(path, root: repositoryInfo.gitCommonDirectory) {
+            return true
         }
 
         if path.hasPrefix(repositoryInfo.repoRoot + "/") {
             let relativePath = String(path.dropFirst(repositoryInfo.repoRoot.count + 1))
-            if relativePath == ".cmuxignore" || relativePath == ".git" {
+            if relativePath == ".git" {
                 return true
             }
             return !relativePath.hasPrefix(".git/")
         }
 
         return false
+    }
+
+    private func isRelevantGitPath(_ path: String, root: String) -> Bool {
+        if path == root {
+            return true
+        }
+
+        guard path.hasPrefix(root + "/") else { return false }
+        let relativePath = String(path.dropFirst(root.count + 1))
+        return relativePath == "HEAD"
+            || relativePath == "index"
+            || relativePath == "packed-refs"
+            || relativePath == "config"
+            || relativePath == "config.worktree"
+            || relativePath == "commondir"
+            || relativePath.hasPrefix("refs/")
     }
 }
 
@@ -2769,24 +2801,26 @@ class TabManager: ObservableObject {
         }
 
         let resolvedRepoRoot = repoRootURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let gitDirectoryURL: URL
         if isDirectory.boolValue {
-            let resolvedGitDirectory = gitMarkerURL.resolvingSymlinksInPath().standardizedFileURL.path
-            return WorkspaceGitRepositoryInfo(
-                repoRoot: resolvedRepoRoot,
-                gitDirectory: resolvedGitDirectory
-            )
+            gitDirectoryURL = gitMarkerURL
+        } else {
+            guard let gitDirectoryPath = resolvedGitDirectoryPath(fromGitFileAt: gitMarkerURL) else {
+                return nil
+            }
+            gitDirectoryURL = URL(fileURLWithPath: gitDirectoryPath)
         }
 
-        guard let gitDirectoryPath = resolvedGitDirectoryPath(fromGitFileAt: gitMarkerURL) else {
-            return nil
-        }
-        let resolvedGitDirectory = URL(fileURLWithPath: gitDirectoryPath)
+        let resolvedGitDirectory = gitDirectoryURL
             .resolvingSymlinksInPath()
             .standardizedFileURL
-            .path
+        let resolvedGitCommonDirectory = resolvedGitCommonDirectoryPath(
+            fromGitDirectory: resolvedGitDirectory
+        )
         return WorkspaceGitRepositoryInfo(
             repoRoot: resolvedRepoRoot,
-            gitDirectory: resolvedGitDirectory
+            gitDirectory: resolvedGitDirectory.path,
+            gitCommonDirectory: resolvedGitCommonDirectory
         )
     }
 
@@ -2815,15 +2849,68 @@ class TabManager: ObservableObject {
         return nil
     }
 
+    private nonisolated static func resolvedGitCommonDirectoryPath(
+        fromGitDirectory gitDirectoryURL: URL
+    ) -> String {
+        let resolvedGitDirectory = gitDirectoryURL.resolvingSymlinksInPath().standardizedFileURL
+        let commondirURL = resolvedGitDirectory.appendingPathComponent("commondir")
+        guard let contents = try? String(contentsOf: commondirURL, encoding: .utf8) else {
+            return resolvedGitDirectory.path
+        }
+
+        let rawValue = contents
+            .split(whereSeparator: \.isNewline)
+            .first
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !rawValue.isEmpty else {
+            return resolvedGitDirectory.path
+        }
+
+        let commonDirectoryURL: URL
+        if rawValue.hasPrefix("/") {
+            commonDirectoryURL = URL(fileURLWithPath: rawValue, isDirectory: true)
+        } else {
+            commonDirectoryURL = resolvedGitDirectory.appendingPathComponent(rawValue, isDirectory: true)
+        }
+        return commonDirectoryURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+    }
+
     private nonisolated static func gitConfigSnapshot(
         for repositoryInfo: WorkspaceGitRepositoryInfo
     ) -> WorkspaceGitConfigSnapshot {
-        guard let contents = try? String(contentsOfFile: repositoryInfo.gitConfigPath, encoding: .utf8) else {
-            return .empty
-        }
-
         var remoteURLsByName: [String: [String]] = [:]
         var metadataWatcherDisabled = false
+        var parsedConfig = false
+
+        for configPath in repositoryInfo.gitConfigPaths {
+            guard let contents = try? String(contentsOfFile: configPath, encoding: .utf8) else {
+                continue
+            }
+            parsedConfig = true
+            applyGitConfig(
+                contents,
+                remoteURLsByName: &remoteURLsByName,
+                metadataWatcherDisabled: &metadataWatcherDisabled
+            )
+        }
+
+        guard parsedConfig else { return .empty }
+
+        return WorkspaceGitConfigSnapshot(
+            remoteURLsByName: remoteURLsByName,
+            metadataWatcherDisabled: metadataWatcherDisabled
+        )
+    }
+
+    private nonisolated static func applyGitConfig(
+        _ contents: String,
+        remoteURLsByName: inout [String: [String]],
+        metadataWatcherDisabled: inout Bool
+    ) {
         var currentSectionName = ""
         var currentSubsectionName: String?
 
@@ -2869,11 +2956,6 @@ class TabManager: ObservableObject {
                 metadataWatcherDisabled = !parsedValue
             }
         }
-
-        return WorkspaceGitConfigSnapshot(
-            remoteURLsByName: remoteURLsByName,
-            metadataWatcherDisabled: metadataWatcherDisabled
-        )
     }
 
     private nonisolated static func gitConfigSubsectionName(from rawValue: String) -> String? {
@@ -2947,6 +3029,10 @@ class TabManager: ObservableObject {
                 if branchHead != "(detached)" {
                     branch = branchHead
                 }
+                continue
+            }
+
+            if line.hasPrefix("#") {
                 continue
             }
 
@@ -3704,6 +3790,16 @@ class TabManager: ObservableObject {
 
     private nonisolated static func githubRepositorySlugs(directory: String) -> [String] {
         guard let repositoryInfo = gitRepositoryInfo(for: directory) else { return [] }
+        if let remoteOutput = runCommand(
+            directory: repositoryInfo.repoRoot,
+            executable: "git",
+            arguments: ["--no-optional-locks", "remote", "-v"],
+            environment: ["GIT_OPTIONAL_LOCKS": "0"],
+            timeout: 2
+        ) {
+            return githubRepositorySlugs(fromGitRemoteVOutput: remoteOutput)
+        }
+
         let configSnapshot = gitConfigSnapshot(for: repositoryInfo)
         guard !configSnapshot.remoteURLsByName.isEmpty else { return [] }
 

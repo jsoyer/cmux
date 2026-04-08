@@ -122,6 +122,36 @@ private func runGit(
     return result.stdout
 }
 
+private func makeTempGitRepoWithInitialCommit(
+    prefix: String,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) throws -> URL {
+    let fileManager = FileManager.default
+    let repoURL = fileManager.temporaryDirectory.appendingPathComponent(
+        "\(prefix)-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    try fileManager.createDirectory(at: repoURL, withIntermediateDirectories: true)
+
+    do {
+        try runGit(["init", "-b", "main"], in: repoURL, file: file, line: line)
+        try runGit(["config", "user.name", "cmux tests"], in: repoURL, file: file, line: line)
+        try runGit(["config", "user.email", "cmux@example.invalid"], in: repoURL, file: file, line: line)
+        try "seed\n".write(
+            to: repoURL.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try runGit(["add", "README.md"], in: repoURL, file: file, line: line)
+        try runGit(["commit", "-m", "Initial commit"], in: repoURL, file: file, line: line)
+        return repoURL
+    } catch {
+        try? fileManager.removeItem(at: repoURL)
+        throw error
+    }
+}
+
 @MainActor
 final class TabManagerChildExitCloseTests: XCTestCase {
     func testChildExitOnLastPanelClosesSelectedWorkspaceAndKeepsIndexStable() {
@@ -632,23 +662,8 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
 
     func testWorkspaceGitMetadataSummaryHonorsCmuxIgnoreOptOut() throws {
         let fileManager = FileManager.default
-        let repoURL = fileManager.temporaryDirectory.appendingPathComponent(
-            "cmux-git-ignore-optout-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try fileManager.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-ignore-optout")
         defer { try? fileManager.removeItem(at: repoURL) }
-
-        try runGit(["init", "-b", "main"], in: repoURL)
-        try runGit(["config", "user.name", "cmux tests"], in: repoURL)
-        try runGit(["config", "user.email", "cmux@example.invalid"], in: repoURL)
-        try "seed\n".write(
-            to: repoURL.appendingPathComponent("README.md"),
-            atomically: true,
-            encoding: .utf8
-        )
-        try runGit(["add", "README.md"], in: repoURL)
-        try runGit(["commit", "-m", "Initial commit"], in: repoURL)
         try "changed\n".write(
             to: repoURL.appendingPathComponent("README.md"),
             atomically: true,
@@ -669,23 +684,8 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
 
     func testWorkspaceGitMetadataSummaryHonorsGitConfigOptOut() throws {
         let fileManager = FileManager.default
-        let repoURL = fileManager.temporaryDirectory.appendingPathComponent(
-            "cmux-git-config-optout-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try fileManager.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-config-optout")
         defer { try? fileManager.removeItem(at: repoURL) }
-
-        try runGit(["init", "-b", "main"], in: repoURL)
-        try runGit(["config", "user.name", "cmux tests"], in: repoURL)
-        try runGit(["config", "user.email", "cmux@example.invalid"], in: repoURL)
-        try "seed\n".write(
-            to: repoURL.appendingPathComponent("README.md"),
-            atomically: true,
-            encoding: .utf8
-        )
-        try runGit(["add", "README.md"], in: repoURL)
-        try runGit(["commit", "-m", "Initial commit"], in: repoURL)
         try runGit(["config", "cmux.metadataWatcher", "false"], in: repoURL)
         try "changed\n".write(
             to: repoURL.appendingPathComponent("README.md"),
@@ -700,25 +700,22 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
         XCTAssertFalse(fileManager.fileExists(atPath: repoURL.appendingPathComponent(".git/index.lock").path))
     }
 
-    func testWorkspaceGitMetadataSummaryReadsDirtyRepoWithoutCreatingIndexLock() throws {
+    func testWorkspaceGitMetadataSummaryKeepsCleanRepoClean() throws {
         let fileManager = FileManager.default
-        let repoURL = fileManager.temporaryDirectory.appendingPathComponent(
-            "cmux-git-no-lock-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try fileManager.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-clean")
         defer { try? fileManager.removeItem(at: repoURL) }
 
-        try runGit(["init", "-b", "main"], in: repoURL)
-        try runGit(["config", "user.name", "cmux tests"], in: repoURL)
-        try runGit(["config", "user.email", "cmux@example.invalid"], in: repoURL)
-        try "seed\n".write(
-            to: repoURL.appendingPathComponent("README.md"),
-            atomically: true,
-            encoding: .utf8
-        )
-        try runGit(["add", "README.md"], in: repoURL)
-        try runGit(["commit", "-m", "Initial commit"], in: repoURL)
+        let summary = TabManager.workspaceGitMetadataSummaryForTesting(directory: repoURL.path)
+        XCTAssertEqual(summary.branch, "main")
+        XCTAssertEqual(summary.isDirty, false)
+        XCTAssertFalse(summary.isWatcherOptedOut)
+        XCTAssertFalse(fileManager.fileExists(atPath: repoURL.appendingPathComponent(".git/index.lock").path))
+    }
+
+    func testWorkspaceGitMetadataSummaryReadsDirtyRepoWithoutCreatingIndexLock() throws {
+        let fileManager = FileManager.default
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-no-lock")
+        defer { try? fileManager.removeItem(at: repoURL) }
         try "changed\n".write(
             to: repoURL.appendingPathComponent("README.md"),
             atomically: true,
@@ -734,19 +731,58 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
 
     func testGitHubRepositorySlugsForTestingReadsGitConfigRemotes() throws {
         let fileManager = FileManager.default
-        let repoURL = fileManager.temporaryDirectory.appendingPathComponent(
-            "cmux-git-config-remotes-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try fileManager.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-config-remotes")
         defer { try? fileManager.removeItem(at: repoURL) }
 
-        try runGit(["init", "-b", "main"], in: repoURL)
         try runGit(["remote", "add", "origin", "https://github.com/manaflow-ai/cmux.git"], in: repoURL)
         try runGit(["remote", "add", "upstream", "git@github.com:ghostty-org/ghostty.git"], in: repoURL)
 
         XCTAssertEqual(
             TabManager.githubRepositorySlugsForTesting(directory: repoURL.path),
+            ["ghostty-org/ghostty", "manaflow-ai/cmux"]
+        )
+    }
+
+    func testWorkspaceGitMetadataSummaryHonorsGitConfigOptOutInLinkedWorktree() throws {
+        let fileManager = FileManager.default
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-worktree-optout")
+        let worktreeURL = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-git-worktree-optout-linked-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer {
+            try? fileManager.removeItem(at: worktreeURL)
+            try? fileManager.removeItem(at: repoURL)
+        }
+
+        try runGit(["config", "cmux.metadataWatcher", "false"], in: repoURL)
+        try runGit(["worktree", "add", "-b", "feature/worktree-optout", worktreeURL.path], in: repoURL)
+
+        let summary = TabManager.workspaceGitMetadataSummaryForTesting(directory: worktreeURL.path)
+        XCTAssertEqual(summary.branch, "feature/worktree-optout")
+        XCTAssertNil(summary.isDirty)
+        XCTAssertTrue(summary.isWatcherOptedOut)
+    }
+
+    func testGitHubRepositorySlugsForTestingReadsRewrittenRemotesInLinkedWorktree() throws {
+        let fileManager = FileManager.default
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-worktree-rewrite")
+        let worktreeURL = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-git-worktree-rewrite-linked-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer {
+            try? fileManager.removeItem(at: worktreeURL)
+            try? fileManager.removeItem(at: repoURL)
+        }
+
+        try runGit(["config", "url.git@github.com:.insteadOf", "gh:"], in: repoURL)
+        try runGit(["remote", "add", "origin", "gh:manaflow-ai/cmux.git"], in: repoURL)
+        try runGit(["remote", "add", "upstream", "gh:ghostty-org/ghostty.git"], in: repoURL)
+        try runGit(["worktree", "add", "-b", "feature/worktree-rewrite", worktreeURL.path], in: repoURL)
+
+        XCTAssertEqual(
+            TabManager.githubRepositorySlugsForTesting(directory: worktreeURL.path),
             ["ghostty-org/ghostty", "manaflow-ai/cmux"]
         )
     }
