@@ -729,6 +729,73 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
         XCTAssertFalse(fileManager.fileExists(atPath: repoURL.appendingPathComponent(".git/index.lock").path))
     }
 
+    func testWorkspaceGitMetadataSummaryUsesGlobalOptionalLocksFlagForStatus() throws {
+        let fileManager = FileManager.default
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-global-optional-locks")
+        let shimDirectoryURL = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-git-shim-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let shimURL = shimDirectoryURL.appendingPathComponent("git")
+        let originalPath = ProcessInfo.processInfo.environment["PATH"]
+        defer {
+            if let originalPath {
+                setenv("PATH", originalPath, 1)
+            } else {
+                unsetenv("PATH")
+            }
+            try? fileManager.removeItem(at: shimDirectoryURL)
+            try? fileManager.removeItem(at: repoURL)
+        }
+
+        try fileManager.createDirectory(at: shimDirectoryURL, withIntermediateDirectories: true)
+        try """
+        #!/bin/sh
+        if [ "$1" = "--no-optional-locks" ]; then
+          shift
+        fi
+        if [ "$1" = "status" ]; then
+          case " $* " in
+            *" --no-optional-locks "*) echo "status received --no-optional-locks after subcommand" >&2; exit 97 ;;
+          esac
+        fi
+        exec /usr/bin/git "$@"
+        """.write(to: shimURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shimURL.path)
+
+        let shimPath = "\(shimDirectoryURL.path):\(originalPath ?? "/usr/bin:/bin:/usr/sbin:/sbin")"
+        setenv("PATH", shimPath, 1)
+
+        let summary = TabManager.workspaceGitMetadataSummaryForTesting(directory: repoURL.path)
+        XCTAssertEqual(summary.branch, "main")
+        XCTAssertEqual(summary.isDirty, false)
+        XCTAssertFalse(summary.isWatcherOptedOut)
+    }
+
+    func testWorkspaceGitMetadataSummaryResolvesSymlinkedRepoDirectory() throws {
+        let fileManager = FileManager.default
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-symlink")
+        let nestedDirectoryURL = repoURL
+            .appendingPathComponent("nested", isDirectory: true)
+            .appendingPathComponent("subdir", isDirectory: true)
+        let symlinkURL = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-git-symlink-link-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer {
+            try? fileManager.removeItem(at: symlinkURL)
+            try? fileManager.removeItem(at: repoURL)
+        }
+
+        try fileManager.createDirectory(at: nestedDirectoryURL, withIntermediateDirectories: true)
+        try fileManager.createSymbolicLink(atPath: symlinkURL.path, withDestinationPath: nestedDirectoryURL.path)
+
+        let summary = TabManager.workspaceGitMetadataSummaryForTesting(directory: symlinkURL.path)
+        XCTAssertEqual(summary.branch, "main")
+        XCTAssertEqual(summary.isDirty, false)
+        XCTAssertFalse(summary.isWatcherOptedOut)
+    }
+
     func testGitHubRepositorySlugsForTestingReadsGitConfigRemotes() throws {
         let fileManager = FileManager.default
         let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-config-remotes")

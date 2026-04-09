@@ -2767,7 +2767,9 @@ class TabManager: ObservableObject {
         for directory: String
     ) -> WorkspaceGitRepositoryInfo? {
         let fileManager = FileManager.default
-        var directoryURL = URL(fileURLWithPath: directory).standardizedFileURL
+        var directoryURL = URL(fileURLWithPath: directory)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: directoryURL.path, isDirectory: &isDirectory) else {
             return nil
@@ -3011,11 +3013,11 @@ class TabManager: ObservableObject {
             directory: directory,
             executable: "git",
             arguments: [
+                "--no-optional-locks",
                 "status",
                 "--porcelain=v2",
                 "--branch",
                 "--untracked-files=no",
-                "--no-optional-locks",
             ],
             environment: ["GIT_OPTIONAL_LOCKS": "0"]
         ) else {
