@@ -996,8 +996,14 @@ class TabManager: ObservableObject {
 
         let workspaceId: UUID
         let panelId: UUID
+        let branch: String
         let resolution: Resolution
         let usedCachedRepoData: Bool
+    }
+
+    private struct WorkspacePullRequestAbsentState: Sendable {
+        let branch: String
+        let fetchedAt: Date
     }
 
     private struct WorkspacePullRequestRepoCacheEntry: Sendable {
@@ -1200,6 +1206,7 @@ class TabManager: ObservableObject {
     private var workspacePullRequestPendingRefreshKeys: Set<WorkspaceGitProbeKey> = []
     private var workspacePullRequestNeedsRefreshOnGitEventKeys: Set<WorkspaceGitProbeKey> = []
     private var workspacePullRequestTransientFailureCountByKey: [WorkspaceGitProbeKey: Int] = [:]
+    private var workspacePullRequestAbsentStateByKey: [WorkspaceGitProbeKey: WorkspacePullRequestAbsentState] = [:]
     private var workspacePullRequestRepoCacheBySlug: [String: WorkspacePullRequestRepoCacheEntry] = [:]
     private var workspacePullRequestRefreshTask: Task<Void, Never>?
     private var workspacePullRequestPendingBypassRepoCache = false
@@ -1730,7 +1737,7 @@ class TabManager: ObservableObject {
         _ results: [WorkspacePullRequestRefreshResult],
         repoResults: [String: WorkspacePullRequestRepoFetchResult],
         requestedKeys: [WorkspaceGitProbeKey],
-        now _: Date,
+        now: Date,
         reason: String
     ) {
         for (repoSlug, repoResult) in repoResults {
@@ -1789,6 +1796,7 @@ class TabManager: ObservableObject {
             switch result.resolution {
             case .resolved(let resolvedPullRequest):
                 workspacePullRequestTransientFailureCountByKey[key] = 0
+                workspacePullRequestAbsentStateByKey.removeValue(forKey: key)
                 guard let status = SidebarPullRequestStatus(rawValue: resolvedPullRequest.statusRawValue),
                       let url = URL(string: resolvedPullRequest.urlString) else {
                     continue
@@ -1804,11 +1812,16 @@ class TabManager: ObservableObject {
                 )
             case .notFound:
                 workspacePullRequestTransientFailureCountByKey[key] = 0
+                workspacePullRequestAbsentStateByKey[key] = WorkspacePullRequestAbsentState(
+                    branch: result.branch,
+                    fetchedAt: now
+                )
                 if workspace.panelPullRequests[result.panelId] != nil {
                     workspace.clearPanelPullRequest(panelId: result.panelId)
                 }
             case .unsupportedRepository:
                 workspacePullRequestTransientFailureCountByKey[key] = 0
+                workspacePullRequestAbsentStateByKey.removeValue(forKey: key)
                 if workspace.panelPullRequests[result.panelId] != nil {
                     workspace.clearPanelPullRequest(panelId: result.panelId)
                 }
@@ -1855,6 +1868,7 @@ class TabManager: ObservableObject {
         workspacePullRequestNeedsRefreshOnGitEventKeys.remove(key)
         workspacePullRequestProbeStateByKey.removeValue(forKey: key)
         workspacePullRequestTransientFailureCountByKey.removeValue(forKey: key)
+        workspacePullRequestAbsentStateByKey.removeValue(forKey: key)
         if workspacePullRequestPendingRefreshKeys.isEmpty {
             workspacePullRequestPendingBypassRepoCache = false
         }
@@ -1869,6 +1883,9 @@ class TabManager: ObservableObject {
         })
         workspacePullRequestProbeStateByKey = workspacePullRequestProbeStateByKey.filter { $0.key.workspaceId != workspaceId }
         workspacePullRequestTransientFailureCountByKey = workspacePullRequestTransientFailureCountByKey.filter { $0.key.workspaceId != workspaceId }
+        workspacePullRequestAbsentStateByKey = workspacePullRequestAbsentStateByKey.filter {
+            $0.key.workspaceId != workspaceId
+        }
         if workspacePullRequestPendingRefreshKeys.isEmpty {
             workspacePullRequestPendingBypassRepoCache = false
         }
@@ -1881,6 +1898,7 @@ class TabManager: ObservableObject {
         workspacePullRequestNeedsRefreshOnGitEventKeys.removeAll()
         workspacePullRequestProbeStateByKey.removeAll()
         workspacePullRequestTransientFailureCountByKey.removeAll()
+        workspacePullRequestAbsentStateByKey.removeAll()
         workspacePullRequestRepoCacheBySlug.removeAll()
         workspacePullRequestPendingBypassRepoCache = false
         workspacePullRequestFollowUpShouldBypassRepoCache = false
@@ -1930,6 +1948,50 @@ class TabManager: ObservableObject {
             return false
         }
         return rerunPending
+    }
+
+    private func shouldRefreshKnownAbsentWorkspacePullRequest(
+        for key: WorkspaceGitProbeKey,
+        branch: String,
+        now: Date
+    ) -> Bool {
+        Self.shouldRefreshKnownAbsentWorkspacePullRequest(
+            branch: branch,
+            absentState: workspacePullRequestAbsentStateByKey[key],
+            now: now
+        )
+    }
+
+    private nonisolated static func shouldRefreshKnownAbsentWorkspacePullRequest(
+        branch: String,
+        absentState: WorkspacePullRequestAbsentState?,
+        now: Date
+    ) -> Bool {
+        guard let absentState,
+              absentState.branch == normalizedBranchName(branch) else {
+            return true
+        }
+        return now.timeIntervalSince(absentState.fetchedAt) >= workspacePullRequestRepoCacheLifetime
+    }
+
+    nonisolated static func shouldRefreshKnownAbsentWorkspacePullRequestForTesting(
+        branch: String,
+        absentBranch: String?,
+        absentAge: TimeInterval?
+    ) -> Bool {
+        let absentState: WorkspacePullRequestAbsentState? = {
+            guard let absentBranch,
+                  let absentAge else { return nil }
+            return WorkspacePullRequestAbsentState(
+                branch: absentBranch,
+                fetchedAt: Date().addingTimeInterval(-absentAge)
+            )
+        }()
+        return shouldRefreshKnownAbsentWorkspacePullRequest(
+            branch: branch,
+            absentState: absentState,
+            now: Date()
+        )
     }
 
     nonisolated static func workspacePullRequestRefreshAllowsRepoCache(reason _: String) -> Bool {
@@ -2639,6 +2701,7 @@ class TabManager: ObservableObject {
             guard case .resolved(let pullRequest) = snapshot.pullRequest else { return nil }
             return pullRequest
         }()
+        let now = Date()
         let resolvedSidebarMetadata = snapshot.branch != nil || resolvedPullRequest != nil
         if resolvedSidebarMetadata {
             workspaceGitTrackedDirectoryByKey[probeKey] = expectedDirectory
@@ -2647,6 +2710,15 @@ class TabManager: ObservableObject {
         }
 
         let nextBranch = snapshot.branch
+        let normalizedNextBranch = nextBranch.flatMap(Self.normalizedBranchName)
+        let shouldRefreshMissingPullRequest = normalizedNextBranch.map { branch in
+            previousPullRequest == nil
+                && shouldRefreshKnownAbsentWorkspacePullRequest(
+                    for: probeKey,
+                    branch: branch,
+                    now: now
+                )
+        } ?? false
         let resolvedDirtyState: Bool? = {
             guard snapshot.branch != nil else { return nil }
             if let isDirty = snapshot.isDirty {
@@ -2693,9 +2765,10 @@ class TabManager: ObservableObject {
 
         if let nextBranch,
            !snapshot.gitMetadataWatcherOptedOut,
+           let normalizedNextBranch,
            shouldForcePullRequestRefresh
-                || Self.normalizedBranchName(nextBranch) != previousBranch
-                || previousPullRequest == nil
+                || normalizedNextBranch != previousBranch
+                || shouldRefreshMissingPullRequest
                 || previousTrackedDirectory != expectedDirectory
                 || previousRepositoryInfo != snapshot.repositoryInfo {
             scheduleWorkspacePullRequestRefresh(
@@ -2915,6 +2988,20 @@ class TabManager: ObservableObject {
     private nonisolated static func gitConfigSnapshot(
         for repositoryInfo: WorkspaceGitRepositoryInfo
     ) -> WorkspaceGitConfigSnapshot {
+        if let configEntries = gitConfigEntries(for: repositoryInfo) {
+            var remoteURLsByName: [String: [String]] = [:]
+            var metadataWatcherDisabled = false
+            applyGitConfigEntries(
+                configEntries,
+                remoteURLsByName: &remoteURLsByName,
+                metadataWatcherDisabled: &metadataWatcherDisabled
+            )
+            return WorkspaceGitConfigSnapshot(
+                remoteURLsByName: remoteURLsByName,
+                metadataWatcherDisabled: metadataWatcherDisabled
+            )
+        }
+
         var remoteURLsByName: [String: [String]] = [:]
         var metadataWatcherDisabled = false
         var parsedConfig = false
@@ -2937,6 +3024,79 @@ class TabManager: ObservableObject {
             remoteURLsByName: remoteURLsByName,
             metadataWatcherDisabled: metadataWatcherDisabled
         )
+    }
+
+    private nonisolated static func gitConfigEntries(
+        for repositoryInfo: WorkspaceGitRepositoryInfo
+    ) -> [(String, String)]? {
+        var entries: [(String, String)] = []
+        var parsedAny = false
+        let environment = [
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+        ]
+
+        if let localEntries = gitConfigEntries(
+            directory: repositoryInfo.repoRoot,
+            arguments: [
+                "--no-optional-locks",
+                "config",
+                "--local",
+                "--includes",
+                "--list",
+                "-z",
+            ],
+            environment: environment
+        ) {
+            entries.append(contentsOf: localEntries)
+            parsedAny = true
+        }
+
+        if let worktreeEntries = gitConfigEntries(
+            directory: repositoryInfo.repoRoot,
+            arguments: [
+                "--no-optional-locks",
+                "config",
+                "--worktree",
+                "--includes",
+                "--list",
+                "-z",
+            ],
+            environment: environment
+        ) {
+            entries.append(contentsOf: worktreeEntries)
+            parsedAny = true
+        }
+
+        return parsedAny ? entries : nil
+    }
+
+    private nonisolated static func gitConfigEntries(
+        directory: String,
+        arguments: [String],
+        environment: [String: String]
+    ) -> [(String, String)]? {
+        guard let output = runCommand(
+            directory: directory,
+            executable: "git",
+            arguments: arguments,
+            environment: environment,
+            timeout: 2
+        ) else {
+            return nil
+        }
+
+        return output
+            .split(separator: "\0", omittingEmptySubsequences: true)
+            .compactMap { entry -> (String, String)? in
+                guard let separatorIndex = entry.firstIndex(of: "\n") else { return nil }
+                let rawKey = entry[..<separatorIndex]
+                let rawValue = entry[entry.index(after: separatorIndex)...]
+                let key = String(rawKey).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !key.isEmpty else { return nil }
+                let value = String(rawValue).trimmingCharacters(in: .whitespacesAndNewlines)
+                return (key, value)
+            }
     }
 
     private nonisolated static func applyGitConfig(
@@ -2985,6 +3145,34 @@ class TabManager: ObservableObject {
 
             if currentSectionName == "cmux",
                key == "metadatawatcher",
+               let parsedValue = gitConfigBoolean(value) {
+                metadataWatcherDisabled = !parsedValue
+            }
+        }
+    }
+
+    private nonisolated static func applyGitConfigEntries(
+        _ entries: [(String, String)],
+        remoteURLsByName: inout [String: [String]],
+        metadataWatcherDisabled: inout Bool
+    ) {
+        for (rawKey, rawValue) in entries {
+            let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if key.hasPrefix("remote."),
+               key.hasSuffix(".url"),
+               key.count > "remote..url".count {
+                let startIndex = key.index(key.startIndex, offsetBy: "remote.".count)
+                let endIndex = key.index(key.endIndex, offsetBy: -".url".count)
+                let remoteName = String(key[startIndex..<endIndex])
+                if !remoteName.isEmpty, !value.isEmpty {
+                    remoteURLsByName[remoteName, default: []].append(value)
+                }
+                continue
+            }
+
+            if key == "cmux.metadatawatcher",
                let parsedValue = gitConfigBoolean(value) {
                 metadataWatcherDisabled = !parsedValue
             }
@@ -3136,6 +3324,7 @@ class TabManager: ObservableObject {
                 return WorkspacePullRequestRefreshResult(
                     workspaceId: candidate.workspaceId,
                     panelId: candidate.panelId,
+                    branch: candidate.branch,
                     resolution: .unsupportedRepository,
                     usedCachedRepoData: false
                 )
@@ -3190,6 +3379,7 @@ class TabManager: ObservableObject {
             return WorkspacePullRequestRefreshResult(
                 workspaceId: candidate.workspaceId,
                 panelId: candidate.panelId,
+                branch: candidate.branch,
                 resolution: resolution,
                 usedCachedRepoData: usedCachedRepoData
             )

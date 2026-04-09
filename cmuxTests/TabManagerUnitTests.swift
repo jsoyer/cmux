@@ -446,6 +446,37 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
         XCTAssertFalse(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "commandHint:merge"))
     }
 
+    func testWorkspacePullRequestRefreshThrottlesKnownAbsentBranchWithinCacheLifetime() {
+        XCTAssertFalse(
+            TabManager.shouldRefreshKnownAbsentWorkspacePullRequestForTesting(
+                branch: "feature/no-pr",
+                absentBranch: "feature/no-pr",
+                absentAge: 14
+            )
+        )
+        XCTAssertTrue(
+            TabManager.shouldRefreshKnownAbsentWorkspacePullRequestForTesting(
+                branch: "feature/no-pr",
+                absentBranch: "feature/no-pr",
+                absentAge: 16
+            )
+        )
+        XCTAssertTrue(
+            TabManager.shouldRefreshKnownAbsentWorkspacePullRequestForTesting(
+                branch: "feature/no-pr",
+                absentBranch: "feature/other",
+                absentAge: 1
+            )
+        )
+        XCTAssertTrue(
+            TabManager.shouldRefreshKnownAbsentWorkspacePullRequestForTesting(
+                branch: "feature/no-pr",
+                absentBranch: nil,
+                absentAge: nil
+            )
+        )
+    }
+
     func testTrackedWorkspaceGitMetadataPollCandidatesIncludeMainAndMasterPanels() throws {
         let manager = TabManager()
         guard let workspace = manager.selectedWorkspace,
@@ -741,6 +772,78 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
         XCTAssertNil(summary.isDirty)
         XCTAssertTrue(summary.isWatcherOptedOut)
         XCTAssertFalse(fileManager.fileExists(atPath: repoURL.appendingPathComponent(".git/index.lock").path))
+    }
+
+    func testWorkspaceGitMetadataSummaryHonorsIncludedGitConfigOptOut() throws {
+        let fileManager = FileManager.default
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-include-optout")
+        defer { try? fileManager.removeItem(at: repoURL) }
+
+        let gitDirectoryURL = repoURL.appendingPathComponent(".git", isDirectory: true)
+        let configURL = gitDirectoryURL.appendingPathComponent("config")
+        let existingConfig = try String(contentsOf: configURL, encoding: .utf8)
+        try (
+            existingConfig
+            + """
+
+            [include]
+                path = cmux-include.cfg
+            """
+        ).write(to: configURL, atomically: true, encoding: .utf8)
+        try """
+        [cmux]
+            metadataWatcher = false
+        """.write(
+            to: gitDirectoryURL.appendingPathComponent("cmux-include.cfg"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "changed\n".write(
+            to: repoURL.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let summary = TabManager.workspaceGitMetadataSummaryForTesting(directory: repoURL.path)
+        XCTAssertEqual(summary.branch, "main")
+        XCTAssertNil(summary.isDirty)
+        XCTAssertTrue(summary.isWatcherOptedOut)
+    }
+
+    func testWorkspaceGitMetadataSummaryHonorsIncludeIfGitConfigOptOut() throws {
+        let fileManager = FileManager.default
+        let repoURL = try makeTempGitRepoWithInitialCommit(prefix: "cmux-git-include-if-optout")
+        defer { try? fileManager.removeItem(at: repoURL) }
+
+        let gitDirectoryURL = repoURL.appendingPathComponent(".git", isDirectory: true)
+        let configURL = gitDirectoryURL.appendingPathComponent("config")
+        let existingConfig = try String(contentsOf: configURL, encoding: .utf8)
+        try (
+            existingConfig
+            + """
+
+            [includeIf "onbranch:main"]
+                path = cmux-include-if.cfg
+            """
+        ).write(to: configURL, atomically: true, encoding: .utf8)
+        try """
+        [cmux]
+            metadataWatcher = false
+        """.write(
+            to: gitDirectoryURL.appendingPathComponent("cmux-include-if.cfg"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "changed\n".write(
+            to: repoURL.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let summary = TabManager.workspaceGitMetadataSummaryForTesting(directory: repoURL.path)
+        XCTAssertEqual(summary.branch, "main")
+        XCTAssertNil(summary.isDirty)
+        XCTAssertTrue(summary.isWatcherOptedOut)
     }
 
     func testWorkspaceGitMetadataSummaryKeepsCleanRepoClean() throws {
