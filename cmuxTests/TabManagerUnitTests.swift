@@ -1153,6 +1153,10 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
           shift
         fi
         if [ "$1" = "status" ]; then
+          if [ "${GIT_OPTIONAL_LOCKS:-}" != "0" ]; then
+            echo "status missing GIT_OPTIONAL_LOCKS=0" >&2
+            exit 98
+          fi
           case " $* " in
             *" --no-optional-locks "*) echo "status received --no-optional-locks after subcommand" >&2; exit 97 ;;
           esac

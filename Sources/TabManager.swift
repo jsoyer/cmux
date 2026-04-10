@@ -994,6 +994,7 @@ class TabManager: ObservableObject {
         let isDirty: Bool?
         let pullRequest: WorkspacePullRequestSnapshot
         let repositoryInfo: WorkspaceGitRepositoryInfo?
+        let repositorySlugs: [String]
         let gitMetadataWatcherOptedOut: Bool
     }
 
@@ -1249,6 +1250,7 @@ class TabManager: ObservableObject {
     private var workspaceGitEventWatchersByRepository: [WorkspaceGitRepositoryInfo: WorkspaceGitEventWatcher] = [:]
     private var workspaceGitWatcherSubscribersByRepository: [WorkspaceGitRepositoryInfo: Set<WorkspaceGitProbeKey>] = [:]
     private var workspaceGitRepositoryByProbeKey: [WorkspaceGitProbeKey: WorkspaceGitRepositoryInfo] = [:]
+    private var workspaceGitRepositorySlugsByRepository: [WorkspaceGitRepositoryInfo: [String]] = [:]
     private var workspaceGitRepositoryOptOutState: [WorkspaceGitRepositoryInfo: Bool] = [:]
     private var workspacePullRequestProbeStateByKey: [WorkspaceGitProbeKey: WorkspaceGitProbeState] = [:]
     private var workspacePullRequestNextPollAtByKey: [WorkspaceGitProbeKey: Date] = [:]
@@ -1369,6 +1371,7 @@ class TabManager: ObservableObject {
         workspaceGitEventWatchersByRepository.removeAll()
         workspaceGitWatcherSubscribersByRepository.removeAll()
         workspaceGitRepositoryByProbeKey.removeAll()
+        workspaceGitRepositorySlugsByRepository.removeAll()
         workspaceGitRepositoryOptOutState.removeAll()
         workspacePullRequestRefreshTask?.cancel()
     }
@@ -1458,6 +1461,7 @@ class TabManager: ObservableObject {
                 clearWorkspaceGitProbes(workspaceId: workspace.id)
                 clearWorkspaceSidebarGitMetadata(workspaceId: workspace.id)
             }
+            stopAllWorkspaceGitEventWatchers()
             resetWorkspacePullRequestRefreshState()
             return
         }
@@ -1558,6 +1562,7 @@ class TabManager: ObservableObject {
         workspaceGitWatcherSubscribersByRepository[repositoryInfo]?.remove(key)
         if workspaceGitWatcherSubscribersByRepository[repositoryInfo]?.isEmpty == true {
             workspaceGitWatcherSubscribersByRepository.removeValue(forKey: repositoryInfo)
+            workspaceGitRepositorySlugsByRepository.removeValue(forKey: repositoryInfo)
             workspaceGitRepositoryOptOutState.removeValue(forKey: repositoryInfo)
             workspaceGitEventWatchersByRepository[repositoryInfo]?.invalidate()
             workspaceGitEventWatchersByRepository.removeValue(forKey: repositoryInfo)
@@ -1578,6 +1583,7 @@ class TabManager: ObservableObject {
         workspaceGitEventWatchersByRepository.removeAll()
         workspaceGitWatcherSubscribersByRepository.removeAll()
         workspaceGitRepositoryByProbeKey.removeAll()
+        workspaceGitRepositorySlugsByRepository.removeAll()
         workspaceGitRepositoryOptOutState.removeAll()
     }
 
@@ -1732,6 +1738,7 @@ class TabManager: ObservableObject {
 
                 let candidate = workspacePullRequestCandidate(
                     workspace: workspace,
+                    probeKey: key,
                     panelId: panelId,
                     branch: branch
                 )
@@ -1795,11 +1802,13 @@ class TabManager: ObservableObject {
 
     private func workspacePullRequestCandidate(
         workspace: Workspace,
+        probeKey: WorkspaceGitProbeKey,
         panelId: UUID,
         branch: String
     ) -> WorkspacePullRequestCandidate {
-        let directory = gitProbeDirectory(for: workspace, panelId: panelId)
-        let repoSlugs = directory.map(Self.githubRepositorySlugs(directory:)) ?? []
+        let repoSlugs = workspaceGitRepositoryByProbeKey[probeKey].flatMap {
+            workspaceGitRepositorySlugsByRepository[$0]
+        } ?? []
         return WorkspacePullRequestCandidate(
             workspaceId: workspace.id,
             panelId: panelId,
@@ -2979,6 +2988,7 @@ class TabManager: ObservableObject {
         workspace.updatePanelDirectory(panelId: probeKey.panelId, directory: expectedDirectory)
         if let repositoryInfo = snapshot.repositoryInfo {
             attachWorkspaceGitEventWatcher(for: probeKey, repositoryInfo: repositoryInfo)
+            workspaceGitRepositorySlugsByRepository[repositoryInfo] = snapshot.repositorySlugs
             workspaceGitRepositoryOptOutState[repositoryInfo] = snapshot.gitMetadataWatcherOptedOut
         } else {
             detachWorkspaceGitEventWatcher(for: probeKey)
@@ -3052,7 +3062,7 @@ class TabManager: ObservableObject {
             break
         }
 
-        if let nextBranch,
+        if snapshot.branch != nil,
            !snapshot.gitMetadataWatcherOptedOut,
            let normalizedNextBranch,
            shouldForcePullRequestRefresh
@@ -3114,6 +3124,7 @@ class TabManager: ObservableObject {
                 isDirty: nil,
                 pullRequest: .notFound,
                 repositoryInfo: nil,
+                repositorySlugs: [],
                 gitMetadataWatcherOptedOut: false
             )
         }
@@ -3129,9 +3140,14 @@ class TabManager: ObservableObject {
                 isDirty: nil,
                 pullRequest: .disabled,
                 repositoryInfo: repositoryInfo,
+                repositorySlugs: [],
                 gitMetadataWatcherOptedOut: true
             )
         }
+
+        let repositorySlugs = branchFromHead == nil
+            ? []
+            : githubRepositorySlugs(directory: repositoryInfo.repoRoot)
 
         if let statusSnapshot = gitStatusSnapshot(directory: repositoryInfo.repoRoot) {
             let branch = normalizedBranchName(statusSnapshot.branch) ?? branchFromHead
@@ -3140,6 +3156,7 @@ class TabManager: ObservableObject {
                 isDirty: statusSnapshot.isDirty,
                 pullRequest: branch == nil ? .notFound : .deferred,
                 repositoryInfo: repositoryInfo,
+                repositorySlugs: branch == nil ? [] : repositorySlugs,
                 gitMetadataWatcherOptedOut: false
             )
         }
@@ -3149,6 +3166,7 @@ class TabManager: ObservableObject {
             isDirty: nil,
             pullRequest: branchFromHead == nil ? .notFound : .deferred,
             repositoryInfo: repositoryInfo,
+            repositorySlugs: repositorySlugs,
             gitMetadataWatcherOptedOut: false
         )
     }
