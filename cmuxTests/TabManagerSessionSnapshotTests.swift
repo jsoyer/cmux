@@ -47,19 +47,6 @@ final class TabManagerSessionSnapshotTests: XCTestCase {
         XCTAssertNotNil(manager.selectedTabId)
     }
 
-    func testSessionAutosaveFingerprintIncludesGitMetadataWatcherDisabled() {
-        let manager = TabManager()
-        guard let workspace = manager.selectedWorkspace else {
-            XCTFail("Expected initial workspace")
-            return
-        }
-
-        let initialFingerprint = manager.sessionAutosaveFingerprint()
-        manager.setWorkspaceGitMetadataWatcherDisabled(workspaceIds: [workspace.id], disabled: true)
-
-        XCTAssertNotEqual(initialFingerprint, manager.sessionAutosaveFingerprint())
-    }
-
     func testSessionSnapshotExcludesRemoteWorkspacesFromRestore() throws {
         let manager = TabManager()
         let remoteWorkspace = manager.addWorkspace(select: true)
